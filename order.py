@@ -1,6 +1,7 @@
 """
 FBC Securities — Order Management System  v3.5
 Virtual scrolling, table view, dealer in red, no duplicate orders on partial fills.
+pyinstaller --onefile --windowed --name "FBC-Order-Manager" --clean order.py
 """
 
 import os, sys, json, threading, uuid as _uuid, csv
@@ -13,7 +14,7 @@ import calendar as _calendar
 
 VERSION       = "1"
 GITHUB_USER   = "Anashe-Masomeke"
-GITHUB_REPO   = "fbc-order-manager"
+GITHUB_REPO   = "order-management"
 GITHUB_BRANCH = "main"
 EXE_NAME      = "FBC-Order-Manager.exe"
 
@@ -29,7 +30,7 @@ def _remote_ver():
 
 def check_and_apply_update():
     rv = _remote_ver()
-    if rv <= 5:
+    if rv <= 1:
         return
     root = tk.Tk(); root.withdraw()
     ok = messagebox.askyesno("FBC Order Manager - Update Available",
@@ -524,7 +525,7 @@ def match_trades_to_orders(csv_rows, open_orders):
     used_order_ids = set()
 
     # ── ONLY TAKEN orders are eligible ──────────────────────────────────
-    eligible = [o for o in open_orders if o.get("status") == "TAKEN"]
+    eligible = [o for o in open_orders if o.get("status") in ("TAKEN", "PARTIAL")]
 
     # Fast CSD lookup: clean_CSD -> list of eligible orders
     csd_index = defaultdict(list)
@@ -2487,11 +2488,11 @@ class ClientHistoryDialog(tk.Toplevel):
 
             row = tk.Frame(inner, bg=rbg); row.pack(fill="x")
 
-            # REPLACE WITH:
             def lbl(text, w, fg="#1A2B3C", bg=rbg, bold=False, align="w"):
+                _a = {"left": "w", "right": "e", "center": "center"}.get(align, align)
                 tk.Label(row, text=str(text) if text else "—", bg=bg, fg=fg,
                          font=(FONT, 9, "bold" if bold else "normal"),
-                         width=w, anchor=align, padx=4, pady=5).pack(side="left")
+                         width=w, anchor=_a, padx=4, pady=5).pack(side="left")
 
             lbl(fmt_date_short(o.get("order_date","")), 10, fg="#607080")
 
@@ -2571,8 +2572,17 @@ class App(tk.Tk):
         tk.Button(top, text="DB Setup", font=(FONT,9), bg=FBC_DARK, fg=SIDEBAR_TXT,
                   relief="flat", cursor="hand2", activebackground=FBC_MID,
                   command=self._open_sheets_setup).pack(side="right", padx=4, pady=4)
-        tk.Label(top, text=f"  {self.dealer_name}", bg=FBC_DARK, fg=SIDEBAR_TXT,
-                 font=(FONT,9)).pack(side="right", padx=8)
+        # Dealer avatar pill
+        dealer_frame = tk.Frame(top, bg=FBC_DARK)
+        dealer_frame.pack(side="right", padx=8)
+        # Circle avatar with initial
+        avatar = tk.Canvas(dealer_frame, width=26, height=26, bg=FBC_DARK, highlightthickness=0)
+        avatar.pack(side="left", pady=6)
+        avatar.create_oval(1, 1, 25, 25, fill=FBC_ACCENT, outline="")
+        avatar.create_text(13, 13, text=self.dealer_name[0].upper(),
+                           font=(FONT, 10, "bold"), fill=WHITE)
+        tk.Label(dealer_frame, text=self.dealer_name, bg=FBC_DARK, fg=WHITE,
+                 font=(FONT, 9, "bold")).pack(side="left", padx=(5, 0))
         tk.Label(top, text=f"v{VERSION}", bg=FBC_DARK, fg="#2A5A8A",
                  font=(FONT,9)).pack(side="right", padx=6)
 
