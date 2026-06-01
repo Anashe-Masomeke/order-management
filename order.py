@@ -1436,10 +1436,22 @@ class MatchedTradesDialog(tk.Toplevel):
             if held_by:
                 tk.Label(r1, text=f"  {held_by}", bg=conf_bg,
                          fg="#C0392B", font=(FONT,9,"bold")).pack(side="left", padx=(8,0))
-            tk.Label(info,
-                     text=(f"CSD: {order.get('csd_no','')}   .   Ordered: {ordered_qty:,} shares"
-                           +(f"   .   Previously filled: {already_filled:,}" if already_filled else "")),
-                     bg=conf_bg, fg="#607080", font=(FONT,8)).pack(anchor="w", pady=(1,0))
+                # Show amount or shares depending on mode
+                order_mode = order.get("amount_mode", "SHARES")
+                order_total_amt = order.get("total_amount", "")
+                order_exch = order.get("exchange", "ZSE")
+                order_currency = "USD" if order_exch == "VFEX" else "ZiG"
+                if order_mode == "AMOUNT" and order_total_amt:
+                    try:
+                        ordered_display = f"Ordered: {order_currency} {float(str(order_total_amt).replace(',', '')):.2f}"
+                    except:
+                        ordered_display = f"Ordered: {order_total_amt}"
+                else:
+                    ordered_display = f"Ordered: {ordered_qty:,} shares"
+                already_filled_txt = (f"   .   Previously filled: {already_filled:,} sh" if already_filled else "")
+                tk.Label(info,
+                         text=f"CSD: {order.get('csd_no', '')}   .   {ordered_display}{already_filled_txt}",
+                         bg=conf_bg, fg="#607080", font=(FONT, 8)).pack(anchor="w", pady=(1, 0))
             fill_label = "PARTIAL FILL" if is_partial else "FULL FILL"
             fill_col   = "#6B21A8" if is_partial else "#1A6B3A"
             currency = "USD" if any((r.get("Market", "") or "").upper() in ("VFX", "VFEX") for r in csv_rows) else "ZiG"
@@ -1522,8 +1534,28 @@ class MatchedTradesDialog(tk.Toplevel):
                          + (f"  ({new_total_fill:,}/{ordered_qty:,} filled)" if ordered_qty else "")
                          + f"  deal total: {currency} {deal_total:,.2f}"
                          + over_note)
-            existing = order.get("notes","")
-            order["notes"] = (existing+"\n"+note_line).strip() if existing else note_line
+            # ── Amount-mode: override status based on deal total vs ordered amount ──
+            amount_mode_o = order.get("amount_mode", "SHARES")
+            total_amount_str = order.get("total_amount", "")
+            if amount_mode_o == "AMOUNT" and total_amount_str:
+                try:
+                    ordered_amt = float(str(total_amount_str).replace(",", ""))
+                    if deal_total >= ordered_amt * 0.995:
+                        order["status"] = "EXECUTED"
+                        note_line += (f"  | AMOUNT FULLY FILLED"
+                                      f" ({currency} {deal_total:,.2f}"
+                                      f" / {ordered_amt:,.2f})")
+                    else:
+                        remaining_amt = ordered_amt - deal_total
+                        order["status"] = "PARTIAL"
+                        note_line += (f"  | AMOUNT PARTIAL:"
+                                      f" {currency} {remaining_amt:,.2f} remaining"
+                                      f" of {ordered_amt:,.2f}")
+                except:
+                    pass
+
+            existing = order.get("notes", "")
+            order["notes"] = (existing + "\n" + note_line).strip() if existing else note_line
             updates.append(order)
         if not updates:
             messagebox.showinfo("Nothing to do","No orders were selected.",parent=self); return
@@ -2755,12 +2787,13 @@ class App(tk.Tk):
 
         tbl_outer = tk.Frame(self, bg=BG); tbl_outer.pack(fill="both", expand=True, padx=16, pady=6)
         self._columns = [
-            ("status","Status",14,"w"),("order_type","Type",5,"center"),
-            ("counter","Counter",10,"w"),("client_name","Client",20,"w"),
-            ("csd_no","CSD",16,"w"),("qty_display","Qty / Filled",17,"e"),
-            ("limit_price","Limit",9,"e"),("order_date","Date",10,"center"),
-            ("entered_by","Entered By",11,"center"),("dealer_col","Dealer",14,"w"),
-            ("actions","Actions",20,"center"),
+            ("status", "Status", 13, "w"), ("order_type", "Type", 5, "center"),
+            ("counter", "Counter", 10, "w"), ("client_name", "Client", 14, "w"),
+            ("csd_no", "CSD", 12, "w"),("qty_display", "Qty / Filled", 28, "e"),
+            ("remaining_display", "Remaining", 20, "e"),
+            ("limit_price", "Limit", 9, "e"), ("order_date", "Date", 10, "center"),
+            ("entered_by", "Entered By", 10, "center"), ("dealer_col", "Dealer", 13, "w"),
+            ("actions", "Actions", 18, "center"),
         ]
         hdr_frame = tk.Frame(tbl_outer, bg=TBL_HDR_BG); hdr_frame.pack(fill="x")
         self._hdr_btns = {}
@@ -2982,28 +3015,65 @@ class App(tk.Tk):
                  font=(FONT,8,"bold"), width=5, anchor="center", pady=6).pack(side="left", padx=(0,2))
 
         lbl(o.get("counter",""), 10, bold=True, fg=FBC_DARK)
-        client = o.get("client_name","")
-        if len(client) > 20: client = client[:19] + "..."
-        lbl(client, 20)
-        lbl(o.get("csd_no",""), 16, fg="#607080")
+        client = o.get("client_name", "")
+        if len(client) > 14: client = client[:13] + "..."
+        lbl(client, 14)
+        lbl(o.get("csd_no", ""), 12, fg="#607080")
+        filled = o.get("shares_executed", 0);
+        ordered = o.get("num_shares", 0)
+        mode = o.get("amount_mode", "SHARES")
+        exch_col = o.get("exchange", "ZSE")
+        currency_col = "USD" if exch_col == "VFEX" else "ZiG"
+        total_amount_col = o.get("total_amount", "")
+        is_over_exec = "OVER-EXECUTION" in (o.get("notes", "") or "")
+        rem_txt = "—"
+        rem_fg = "#C0C8D8"
+        if mode == "AMOUNT":
+            try:
+                amt_f = float(str(total_amount_col).replace(",", ""))
+            except:
+                amt_f = 0.0
+            if filled and amt_f > 0:
+                try:
+                    ep = float(str(o.get("execution_price", "")).replace(",", ""))
+                    amt_filled = filled * ep
+                    pct = int((amt_filled / amt_f) * 100)
+                    qty_txt = f"{amt_filled:,.2f} / {amt_f:,.2f} ({pct}%)"
+                    amt_remaining = max(0.0, amt_f - amt_filled)
+                    if amt_remaining > 0.01:
+                        rem_txt = f"{amt_remaining:,.2f}"
+                        rem_fg = "#B45309"
+                    else:
+                        rem_txt = "✓ FULL"
+                        rem_fg = "#1A6B3A"
+                except:
+                    qty_txt = f"{amt_f:,.2f}"
+            else:
+                qty_txt = f"{amt_f:,.2f}" if amt_f else str(total_amount_col)
 
-        filled = o.get("shares_executed",0); ordered = o.get("num_shares",0)
-        mode = o.get("amount_mode","SHARES")
-        if mode=="AMOUNT" and not ordered: qty_txt = f"Amt {o.get('total_amount','?')}"
         elif filled and ordered:
             remaining = ordered - filled
-            qty_txt = f"{filled:,}/{ordered:,}"
-            if remaining > 0: qty_txt += f" ({remaining:,}r)"
-        else: qty_txt = f"{ordered:,}" if ordered else "-"
-        # REPLACE WITH:
-        # Check if notes contain an over-execution warning
-        is_over_exec = "OVER-EXECUTION" in (o.get("notes", "") or "")
-        qty_fg = "#B71C1C" if is_over_exec else ("#6B21A8" if (status == "PARTIAL" and filled) else "#1A2B3C")
-        lbl(qty_txt, 17, anchor="e", fg=qty_fg, bold=(status == "PARTIAL" or is_over_exec))
+            pct = int((filled / ordered) * 100) if ordered else 0
+            qty_txt = f"{filled:,} / {ordered:,} ({pct}%)"
+            if remaining > 0:
+                rem_txt = f"{remaining:,} sh"
+                rem_fg = "#B45309"
+            else:
+                rem_txt = "✓ FULL"
+                rem_fg = "#1A6B3A"
+        else:
+            qty_txt = f"{ordered:,}" if ordered else "-"
+            rem_txt = "—";
+            rem_fg = "#C0C8D8"
+
+        qty_fg = "#B71C1C" if is_over_exec else (
+            "#0066B3" if mode == "AMOUNT" else
+            "#6B21A8" if (status == "PARTIAL" and filled) else "#1A2B3C")
+        lbl(qty_txt, 28, anchor="e", fg=qty_fg, bold=(mode == "AMOUNT" or status == "PARTIAL" or is_over_exec))
+        lbl(rem_txt, 20, anchor="e", fg=rem_fg, bold=(rem_txt not in ("—", "✓ FULL") or rem_txt == "✓ FULL"))
         lbl(o.get("limit_price","-"), 9, anchor="e", fg="#607080")
         lbl(fmt_date_short(o.get("order_date","")), 10, anchor="center", fg="#607080")
-        lbl(o.get("entered_by",""), 11, anchor="center", fg="#607080")
-
+        lbl(o.get("entered_by", ""), 10, anchor="center", fg="#607080")
         # Dealer column - RED for TAKEN/PARTIAL
         taken   = o.get("taken_by","")
         exec_by = o.get("executed_by","")
@@ -3018,8 +3088,8 @@ class App(tk.Tk):
         else:
             dealer_txt = "-"; dealer_fg = "#C0C8D8"; dealer_bg = row_bg
         tk.Label(row, text=dealer_txt, bg=dealer_bg, fg=dealer_fg,
-                 font=(FONT,8,"bold" if (taken and status in ("TAKEN","PARTIAL")) else "normal"),
-                 width=14, anchor="w", padx=4, pady=6).pack(side="left", padx=(0,2))
+                 font=(FONT, 8, "bold" if (taken and status in ("TAKEN", "PARTIAL")) else "normal"),
+                 width=13, anchor="w", padx=4, pady=6).pack(side="left", padx=(0, 2))
 
         act_frame = tk.Frame(row, bg=row_bg); act_frame.pack(side="left", padx=4)
         def mini_btn(text, bg, fg, cmd, width=5):
