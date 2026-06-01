@@ -12,7 +12,7 @@ from tkinter import ttk, messagebox, filedialog
 from datetime import datetime, date
 import calendar as _calendar
 
-VERSION       = "1"
+VERSION       = "2"
 GITHUB_USER   = "Anashe-Masomeke"
 GITHUB_REPO   = "order-management"
 GITHUB_BRANCH = "main"
@@ -30,7 +30,7 @@ def _remote_ver():
 
 def check_and_apply_update():
     rv = _remote_ver()
-    if rv <= 1:
+    if rv <= 2:
         return
     root = tk.Tk(); root.withdraw()
     ok = messagebox.askyesno("FBC Order Manager - Update Available",
@@ -142,9 +142,13 @@ def _supa_request(url, key, method, table, body=None, params=None):
     data = json.dumps(body).encode() if body else None
     headers = {"apikey": key, "Authorization": f"Bearer {key}",
                "Content-Type": "application/json", "Prefer": "return=representation"}
+    import ssl
+    _ctx = ssl.create_default_context()
+    _ctx.check_hostname = False
+    _ctx.verify_mode = ssl.CERT_NONE
     req = _urllib_req.Request(full, data=data, headers=headers, method=method)
     try:
-        with _urllib_req.urlopen(req, timeout=15) as r:
+        with _urllib_req.urlopen(req, timeout=15, context=_ctx) as r:
             raw = r.read().decode()
             return json.loads(raw) if raw.strip() else []
     except _urllib_err.HTTPError as e:
