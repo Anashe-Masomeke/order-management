@@ -12,7 +12,7 @@ from tkinter import ttk, messagebox, filedialog
 from datetime import datetime, date
 import calendar as _calendar
 
-VERSION       = "2"
+VERSION       = "3"
 GITHUB_USER   = "Anashe-Masomeke"
 GITHUB_REPO   = "order-management"
 GITHUB_BRANCH = "main"
@@ -30,7 +30,7 @@ def _remote_ver():
 
 def check_and_apply_update():
     rv = _remote_ver()
-    if rv <= 2:
+    if rv <= int(VERSION):  # compare against current app version
         return
     root = tk.Tk(); root.withdraw()
     ok = messagebox.askyesno("FBC Order Manager - Update Available",
