@@ -178,8 +178,8 @@ def _order_to_record(o):
         "notes": o.get("notes",""), "partial_of": o.get("partial_of",""),
         "amount_mode": o.get("amount_mode", "SHARES"), "total_amount": o.get("total_amount", ""),
         "tel_no": o.get("tel_no", ""),
+        "tax_exempt": o.get("tax_exempt", False),
     }
-
 def _record_to_order(r):
     def s(k, d=""): return r.get(k, d) or d
     def si(k):
@@ -199,8 +199,8 @@ def _record_to_order(r):
         "notes": s("notes"), "partial_of": s("partial_of"),
         "amount_mode": s("amount_mode", "SHARES"), "total_amount": s("total_amount"),
         "tel_no": s("tel_no"),
+        "tax_exempt": bool(r.get("tax_exempt", False)),
     }
-
 
 class SheetsDB:
     def __init__(self, url, key):
@@ -511,98 +511,151 @@ def parse_matched_trades_csv(filepath):
     return rows
 def match_trades_to_orders(csv_rows, open_orders):
     """
-    v3.6: Strict CSD-first matching.
+    v3.7: CSD + SCA-Code (custodian) + ticker + direction matching.
 
-    RULES (all must pass — no fallbacks):
-    1. Only TAKEN orders are eligible. PENDING orders are NOT matched.
-    2. CSD Account in CSV must exactly equal csd_no stored in the order.
-    3. Security ticker must match (exchange suffix stripped from both sides).
-    4. Buy/Sell direction must match order_type (Buy=BUY, Sell=SELL).
+    CUSTODIAN → SCA PREFIX MAP:
+      FBC     → FBC
+      CABS    → CBC
+      CBZ     → CBZ
+      STANBIC → STIN
 
-    If any rule fails the CSV row goes to unmatched. No counter-only or
-    name-only fallback — those cause wrong-client matches.
+    RULES (all must pass):
+    1. Only TAKEN or PARTIAL orders are eligible.
+    2. CSD Account in CSV must exactly equal csd_no in order.
+    3. Custodian prefix: SCA Code in CSV must START WITH the mapped prefix
+       for the custodian stored on the order.
+    4. Security ticker must match (exchange suffix stripped).
+    5. Buy/Sell direction must match order_type.
+
+    Multiple CSV rows for the same order are AGGREGATED (summed) before
+    building the execution — one order can have many fills.
     """
     from collections import defaultdict
+
+    CUSTODIAN_PREFIX = {
+        "FBC":     "FBC",
+        "CABS":    "CBC",
+        "CBZ":     "CBZ",
+        "STANBIC": "STIN",
+    }
 
     matched        = []
     unmatched      = []
     used_order_ids = set()
 
-    # ── ONLY TAKEN orders are eligible ──────────────────────────────────
+    # Only TAKEN/PARTIAL orders are eligible
     eligible = [o for o in open_orders if o.get("status") in ("TAKEN", "PARTIAL")]
 
-    # Fast CSD lookup: clean_CSD -> list of eligible orders
+    # Index: clean_CSD -> list of eligible orders
     csd_index = defaultdict(list)
     for o in eligible:
         key = _clean_csd(o.get("csd_no", ""))
         if key:
             csd_index[key].append(o)
 
+    # Group CSV rows by (csd, sca_prefix, ticker, direction) so multiple
+    # fills for the same order are handled together.
+    # We'll do a two-pass: first find which order each row belongs to,
+    # then aggregate rows per order.
+
+    order_to_rows = defaultdict(list)   # order_id -> [csv_row, ...]
+    unmatched_rows = []
+
     for row in csv_rows:
         csv_csd  = _clean_csd(row.get("CSD Account", "") or row.get("CSD", "") or "")
+        csv_sca  = (row.get("SCA Code") or "").strip().upper()
         csv_tick = _ticker_from_security(row.get("Security", ""))
         csv_dir  = (row.get("Buy/Sell") or "").strip().lower()
 
         best_order = None
-        best_conf  = "HIGH"
-        best_how   = ""
 
-        # CSD must be present in CSV AND exist in our eligible orders
         if csv_csd and csv_csd in csd_index:
             for o in csd_index[csv_csd]:
                 if o["id"] in used_order_ids:
                     continue
-                # Security ticker must match
-                cm, chow = _counter_matches(csv_tick, o.get("counter", ""))
+
+                # ── Custodian / SCA Code check ───────────────────────
+                order_custodian = (o.get("custodian") or "").strip().upper()
+                expected_prefix = CUSTODIAN_PREFIX.get(order_custodian, "")
+                if expected_prefix and csv_sca:
+                    if not csv_sca.startswith(expected_prefix):
+                        continue   # wrong custodian
+                # If custodian not in our map or SCA missing, skip the
+                # custodian check rather than falsely reject
+
+                # ── Ticker check ─────────────────────────────────────
+                cm, _ = _counter_matches(csv_tick, o.get("counter", ""))
                 if not cm:
                     continue
-                # Direction must match
+
+                # ── Direction check ──────────────────────────────────
                 if not _direction_matches(csv_dir, o.get("order_type", "")):
                     continue
-                # All three checks passed
+
                 best_order = o
-                best_how   = f"CSD (exact) + counter ({chow}) + direction"
                 break
 
         if best_order:
-            used_order_ids.add(best_order["id"])
-            matched.append((best_order, [row], best_conf, best_how))
+            # Don't mark used yet — multiple rows can belong to same order
+            order_to_rows[best_order["id"]].append((best_order, row))
         else:
-            unmatched.append(row)
+            unmatched_rows.append(row)
 
-    return matched, unmatched
+    # Now build matched list: one entry per order with ALL its rows
+    seen_ids = set()
+    for order_id, pairs in order_to_rows.items():
+        order    = pairs[0][0]          # same order object in all pairs
+        csv_rows_for_order = [p[1] for p in pairs]
+        used_order_ids.add(order_id)
+        seen_ids.add(order_id)
+        matched.append((order, csv_rows_for_order, "HIGH",
+                        f"CSD (exact) + custodian SCA + counter + direction "
+                        f"[{len(csv_rows_for_order)} fill(s) aggregated]"))
+
+    return matched, unmatched_rows
 def build_execution_from_rows(order, csv_rows):
     """
-    Aggregate CSV fills for one order.
-    Returns (total_qty, avg_price, status_flag, excess_qty)
+    Aggregate ALL CSV fills for one order.
+    Multiple rows are summed: total_qty = sum of all Quantity values,
+    avg_price = weighted average of all fills.
 
-    status_flag:
-      "OK"            — qty fits within what was ordered
-      "OVER_EXECUTED" — CSV qty exceeds ordered qty (warning shown, unchecked)
+    Price rule: Yield column.
+      - Market VFX/VFEX → price is already USD (use as-is)
+      - Market ZSE/other → Yield is in cents, divide by 100 to get ZiG
+        BUT if Yield value looks like it's already in ZiG (e.g. 3000.0
+        when limit price is ~3000) keep as-is. Heuristic: if Yield > 500
+        and Market != VFEX treat as cents only if Yield/100 is plausible.
 
-    Price: Yield column is always in cents. Divide by 100 to get ZiG.
-    e.g. Yield=900 → 9.00 ZiG,  Yield=9000 → 90.00 ZiG
+    Returns:
+      (total_qty, avg_price, status_flag, excess_qty,
+       deal_total, total_charges, amount_remaining)
     """
     total_qty   = 0
     total_value = 0.0
 
     for r in csv_rows:
-        qty = _clean_qty(r.get("Quantity", 0))
+        qty       = _clean_qty(r.get("Quantity", 0))
+        market    = (r.get("Market") or "").strip().upper()
         yield_raw = _clean_price(r.get("Yield") or 0)
-        market = (r.get("Market") or "").strip().upper()
-        if market == "VFX" or market == "VFEX":
-            price = round(yield_raw, 4)  # already USD
+
+        if market in ("VFX", "VFEX"):
+            price = round(yield_raw, 4)          # already USD
         else:
-            price = round(yield_raw / 100, 4)  # ZSE cents → ZiG
+            # ZSE: Yield is in cents (e.g. 3000 = ZiG 30.00)
+            # But real-world ZSE yields can also be 3025.00 meaning ZiG 30.25
+            # Rule: always divide by 100 for ZSE
+            price = round(yield_raw / 100, 4)
+
         total_qty   += qty
         total_value += qty * price
 
     avg_price = round(total_value / total_qty, 4) if total_qty else 0.0
 
-    # ── Calculate deal total including charges ───────────────────────────
-    is_vfex = any((r.get("Market") or "").strip().upper() in ("VFX", "VFEX") for r in csv_rows)
+    is_vfex       = any((r.get("Market") or "").strip().upper() in ("VFX","VFEX")
+                        for r in csv_rows)
     consideration = total_qty * avg_price
-    order_type = order.get("order_type", "BUY").upper()
+    order_type    = order.get("order_type", "BUY").upper()
+
     if is_vfex:
         commission = consideration * 0.0060
         vat_comm = commission * 0.155
@@ -612,42 +665,45 @@ def build_execution_from_rows(order, csv_rows):
         sec_levy = consideration * 0.0016
         total_charges = commission + vat_comm + vfex_levy + csd_levy + stamp + sec_levy
     else:
+        tax_exempt = order.get("tax_exempt", False)
         commission = consideration * 0.0092
         vat_comm = commission * 0.155
         zse_levy = consideration * 0.0010
         csd_levy = consideration * 0.0010
-        stamp = consideration * 0.0025
+        stamp = consideration * 0.0025 if order_type == "BUY" else 0.0
         sec_levy = consideration * 0.0016
         inv_prot = consideration * 0.00025
-        cap_gains = consideration * 0.010
-        total_charges = commission + vat_comm + zse_levy + csd_levy + stamp + sec_levy + inv_prot + cap_gains
-    if order_type == "BUY":
-        deal_total = consideration + total_charges
-    else:
-        deal_total = consideration - total_charges
+        cap_gains = 0.0 if tax_exempt else consideration * 0.010
+        total_charges = (commission + vat_comm + zse_levy + csd_levy +
+                         stamp + sec_levy + inv_prot + cap_gains)
+
+    deal_total = (consideration + total_charges if order_type == "BUY"
+                  else consideration - total_charges)
 
     ordered_qty = order.get("num_shares", 0)
     already_filled = order.get("shares_executed", 0)
-    new_cumulative = already_filled + total_qty  # raw, uncapped
+    new_cumulative = already_filled + total_qty
 
-    # ── Check against total_amount if order was entered by amount ────────
-    amount_mode = order.get("amount_mode", "SHARES")
-    total_amount = order.get("total_amount", "")
-    amount_filled = False
+    # Amount-mode check
+    amount_mode    = order.get("amount_mode", "SHARES")
+    total_amount   = order.get("total_amount", "")
+    amount_filled  = False
     amount_remaining = None
     if amount_mode == "AMOUNT" and total_amount:
         try:
-            ordered_amount = float(str(total_amount).replace(",", ""))
-            amount_filled = (deal_total >= ordered_amount * 0.995)  # 0.5% tolerance
+            ordered_amount   = float(str(total_amount).replace(",", ""))
+            amount_filled    = (deal_total >= ordered_amount * 0.995)
             amount_remaining = max(0.0, ordered_amount - deal_total)
         except:
             pass
 
     if ordered_qty > 0 and new_cumulative > ordered_qty:
         excess = new_cumulative - ordered_qty
-        return total_qty, avg_price, "OVER_EXECUTED", excess, deal_total, total_charges, amount_remaining
+        return (total_qty, avg_price, "OVER_EXECUTED", excess,
+                deal_total, total_charges, amount_remaining)
 
-    return total_qty, avg_price, "OK", 0, deal_total, total_charges, amount_remaining
+    return (total_qty, avg_price, "OK", 0,
+            deal_total, total_charges, amount_remaining)
 class SheetsSetupDialog(tk.Toplevel):
     def __init__(self, parent, settings, on_save):
         super().__init__(parent)
@@ -777,7 +833,8 @@ class ClientLookup:
                              "client_address": o.get("client_address", ""), "csd_no": key,
                              "custodian": o.get("custodian", "FBC"),
                              "instruction_by": o.get("instruction_by", "CLIENT"),
-                             "tel_no": o.get("tel_no", "")}
+                             "tel_no": o.get("tel_no", ""),
+                             "tax_exempt": o.get("tax_exempt", False)}
             else:
                 # Update tel_no if a newer order has it and the cached one doesn't
                 if not seen[key].get("tel_no") and o.get("tel_no"):
@@ -814,7 +871,7 @@ class NewOrderDialog(tk.Toplevel):
         if not hasattr(self, "_hist_bar") or not self._hist_bar.winfo_exists():
             self._hist_bar = tk.Frame(self, bg="#E8F1FB", pady=4)
             # Place it just above the btn_bar which is always the last child
-            self._hist_bar.pack(fill="x", side="bottom", before=self.winfo_children()[-1])
+        self._hist_bar.pack(fill="x", side="bottom")
         for w in self._hist_bar.winfo_children():
             w.destroy()
         tk.Label(self._hist_bar,
@@ -905,9 +962,6 @@ class NewOrderDialog(tk.Toplevel):
                 self._custodian.set(c["custodian"])
                 self._instruction_by.set(c["instruction_by"])
                 self._tel_no.set(c.get("tel_no", ""))
-                self._suggest_frame.pack_forget()
-                # Show history button
-                self._show_history_btn(c["client_name"], c["csd_no"])
 
         self._client_name.trace_add("write", _on_name_change)
         self._suggest_lb.bind("<<ListboxSelect>>", _on_select)
@@ -922,11 +976,31 @@ class NewOrderDialog(tk.Toplevel):
         tk.Label(r, text="Custodian", bg=CARD_BG, fg="#607080",
                  font=(FONT,9), width=18, anchor="w").pack(side="left")
         make_combo(r, self._custodian, CUSTODIANS).pack(side="left", ipady=3, padx=(4,0))
-        r = tk.Frame(cl_card, bg=CARD_BG); r.pack(fill="x", pady=2)
+        r = tk.Frame(cl_card, bg=CARD_BG);
+        r.pack(fill="x", pady=2)
         tk.Label(r, text="Instruction by", bg=CARD_BG, fg="#607080",
-                 font=(FONT,9), width=18, anchor="w").pack(side="left")
+                 font=(FONT, 9), width=18, anchor="w").pack(side="left")
         make_combo(r, self._instruction_by,
-                   ["CLIENT","BROKER","OTHER"]).pack(side="left", ipady=3, padx=(4,0))
+                   ["CLIENT", "BROKER", "OTHER"]).pack(side="left", ipady=3, padx=(4, 0))
+
+        # Tax exempt toggle
+        r = tk.Frame(cl_card, bg=CARD_BG);
+        r.pack(fill="x", pady=2)
+        tk.Label(r, text="Tax status", bg=CARD_BG, fg="#607080",
+                 font=(FONT, 9), width=18, anchor="w").pack(side="left")
+        self._tax_exempt = tk.BooleanVar(value=False)
+        tax_frame = tk.Frame(r, bg=CARD_BG);
+        tax_frame.pack(side="left")
+        self._tax_chk = tk.Checkbutton(tax_frame, text="Tax Exempt (no CGT)",
+                                       variable=self._tax_exempt,
+                                       bg=CARD_BG, fg="#B45309", selectcolor=CARD_BG,
+                                       font=(FONT, 9, "bold"), cursor="hand2",
+                                       activebackground=CARD_BG,
+                                       command=self._on_tax_change)
+        self._tax_chk.pack(side="left")
+        self._tax_badge = tk.Label(tax_frame, text="", bg=CARD_BG,
+                                   font=(FONT, 8))
+        self._tax_badge.pack(side="left", padx=(8, 0))
 
         section_lbl(body, "ORDER DETAILS")
         od_card = card_frame(body); od_card.pack(fill="x")
@@ -998,6 +1072,27 @@ class NewOrderDialog(tk.Toplevel):
         else:
             self._shares_row.pack_forget(); self._amount_row.pack(fill="x", pady=2)
 
+    def _on_qty_mode(self):
+        if self._qty_mode.get() == "SHARES":
+            self._amount_row.pack_forget();
+            self._shares_row.pack(fill="x", pady=2)
+        else:
+            self._shares_row.pack_forget();
+            self._amount_row.pack(fill="x", pady=2)
+
+    def _on_tax_change(self):
+        if self._tax_exempt.get():
+            self._tax_badge.config(
+                text="⚠ Capital Gains Tax will NOT be charged",
+                fg="#B45309", bg="#FFF8E7")
+            self._tax_chk.config(bg="#FFF8E7")
+            self._tax_badge.master.config(bg="#FFF8E7")
+        else:
+            self._tax_badge.config(text="Standard ZSE charges apply",
+                                   fg="#1A6B3A", bg=CARD_BG)
+            self._tax_chk.config(bg=CARD_BG)
+            self._tax_badge.master.config(bg=CARD_BG)
+
     def _save(self):
         client = self._client_name.get().strip(); csd = self._csd_no.get().strip()
         counter = self._counter.get().strip(); limit = self._limit_price.get().strip()
@@ -1033,7 +1128,12 @@ class NewOrderDialog(tk.Toplevel):
                     if exch == "VFEX":
                         charge_rate = 0.0060 + 0.0016 + 0.0005 + 0.0025 + (0.0060 * 0.155) + 0.0016
                     else:
-                        charge_rate = 0.0092 + 0.0010 + 0.0010 + 0.0025 + (0.0092 * 0.155) + 0.0016 + 0.00025 + 0.010
+                        # Stamp duty on BUY only, CGT on taxable clients only
+                        cgt = 0.0 if self._tax_exempt.get() else 0.010
+                        if order_type == "BUY":
+                            charge_rate = 0.0092 + 0.0010 + 0.0010 + 0.0025 + (0.0092 * 0.155) + 0.0016 + 0.00025 + cgt
+                        else:
+                            charge_rate = 0.0092 + 0.0010 + 0.0010 + (0.0092 * 0.155) + 0.0016 + 0.00025 + cgt
                     if order_type == "BUY":
                         est_shares = int(amt / (price * (1 + charge_rate)))
                     else:
@@ -1053,10 +1153,10 @@ class NewOrderDialog(tk.Toplevel):
                             vat_comm = commission * 0.155
                             zse_levy = consideration * 0.0010
                             csd_levy = consideration * 0.0010
-                            stamp = consideration * 0.0025
+                            stamp = consideration * 0.0025 if order_type == "BUY" else 0.0
                             sec_levy = consideration * 0.0016
                             inv_prot = consideration * 0.00025
-                            cap_gains = consideration * 0.010
+                            cap_gains = 0.0 if self._tax_exempt.get() else consideration * 0.010
                             total_charges = commission + vat_comm + zse_levy + csd_levy + stamp + sec_levy + inv_prot + cap_gains
                         if order_type == "BUY":
                             deal_total = consideration + total_charges
@@ -1106,6 +1206,7 @@ class NewOrderDialog(tk.Toplevel):
             "tel_no": self._tel_no.get().strip(),
             "notes": self._notes.get("1.0","end").strip(),
             "partial_of": "", "amount_mode": mode, "total_amount": total_amount,
+            "tax_exempt": self._tax_exempt.get(),
         }
         try: self._canvas.unbind_all("<MouseWheel>")
         except: pass
@@ -1298,7 +1399,10 @@ class OrderDetailDialog(tk.Toplevel):
         tk.Label(body, text="CLIENT", bg=BG, fg=FBC_MID, font=(FONT,8,"bold")).pack(anchor="w", pady=(0,3))
         detail_row("Client name",o["client_name"],bold=True)
         detail_row("Client address",o["client_address"]); detail_row("CSD number",o["csd_no"])
-        detail_row("Custodian",o["custodian"]); detail_row("Instruction by",o["instruction_by"])
+        detail_row("Custodian", o["custodian"]);
+        detail_row("Instruction by", o["instruction_by"])
+        if o.get("tax_exempt"):
+            detail_row("Tax Status", "⚠ TAX EXEMPT — No Capital Gains Tax")
         divider()
         tk.Label(body, text="WORKFLOW", bg=BG, fg=FBC_MID, font=(FONT,8,"bold")).pack(anchor="w", pady=(0,3))
         detail_row("Entered by",o["entered_by"]); detail_row("Entered at",fmt_dt(o["entered_datetime"]))
@@ -2679,8 +2783,8 @@ class App(tk.Tk):
         self.db = SheetsDB(url, key) if (url and key) else None
         self.orders = []
         self._filter     = "all"
-        self._sort_col   = "entered_datetime"
-        self._sort_asc   = False
+        self._sort_col = "entered_datetime"
+        self._sort_asc = False
         self._visible_orders     = []
         self._row_height         = 34
         self._render_buffer      = 5
@@ -2789,21 +2893,27 @@ class App(tk.Tk):
         self._columns = [
             ("status", "Status", 13, "w"), ("order_type", "Type", 5, "center"),
             ("counter", "Counter", 10, "w"), ("client_name", "Client", 14, "w"),
-            ("csd_no", "CSD", 12, "w"),("qty_display", "Qty / Filled", 28, "e"),
-            ("remaining_display", "Remaining", 20, "e"),
+            ("csd_no", "CSD", 12, "w"), ("qty_display", "Qty / Filled", 24, "e"),
+            ("remaining_display", "Remaining", 18, "e"),
             ("limit_price", "Limit", 9, "e"), ("order_date", "Date", 10, "center"),
             ("entered_by", "Entered By", 10, "center"), ("dealer_col", "Dealer", 13, "w"),
             ("actions", "Actions", 18, "center"),
         ]
+        self._col_widths = {c[0]: 80 for c in self._columns}  # default until data loads
         hdr_frame = tk.Frame(tbl_outer, bg=TBL_HDR_BG); hdr_frame.pack(fill="x")
         self._hdr_btns = {}
         for col_id, label, width, anchor in self._columns:
-            btn = tk.Button(hdr_frame, text=label, font=(FONT,8,"bold"),
+            cell = tk.Frame(hdr_frame, bg=TBL_HDR_BG,
+                            width=self._col_widths.get(col_id, 80), height=30)
+            cell.pack(side="left", padx=1)
+            cell.pack_propagate(False)
+            btn = tk.Button(cell, text=label, font=(FONT, 8, "bold"),
                             bg=TBL_HDR_BG, fg=TBL_HDR_FG, relief="flat",
                             activebackground="#003070", activeforeground=WHITE,
-                            cursor="hand2", anchor=anchor, width=width, pady=5,
+                            cursor="hand2", anchor=anchor, pady=5,
                             command=lambda c=col_id: self._sort_by(c))
-            btn.pack(side="left", padx=1); self._hdr_btns[col_id] = btn
+            btn.pack(fill="both", expand=True)
+            self._hdr_btns[col_id] = btn
 
         row_outer = tk.Frame(tbl_outer, bg=BG); row_outer.pack(fill="both", expand=True)
         self._tbl_canvas = tk.Canvas(row_outer, bg=BG, highlightthickness=0)
@@ -2864,11 +2974,129 @@ class App(tk.Tk):
         threading.Thread(target=_do, daemon=True).start()
 
     def _apply_orders(self, orders):
-        self.orders = orders; self._update_sync_badge(); self._refresh()
+        self.orders = orders;
+        self._update_sync_badge();
+        self._refresh()
+
+    def _refresh_headers(self):
+        for col_id, label, width, anchor in self._columns:
+            btn = self._hdr_btns.get(col_id)
+            if btn:
+                px = self._col_widths.get(col_id, 80)
+                btn.master.config(width=px)  # resize the cell Frame
+                btn.config(width=px)  # resize the Button inside it
 
     def _schedule_auto_sync(self):
         self._full_sync(); self.after(20_000, self._schedule_auto_sync)
 
+    def _calc_col_widths(self, orders):
+        """Calculate column widths based on widest content per column."""
+        import tkinter.font as tkfont
+        f_normal = tkfont.Font(family=FONT, size=9)
+        f_bold = tkfont.Font(family=FONT, size=9, weight="bold")
+        f_hdr = tkfont.Font(family=FONT, size=8, weight="bold")
+
+        PAD = 20  # padding on each side of text inside a cell
+
+        # Seed with header label widths
+        widths = {c[0]: f_hdr.measure(c[1]) + PAD * 2 for c in self._columns}
+
+        # Hard minimums so nothing ever disappears
+        MINS = {
+            "status": 90,
+            "order_type": 50,
+            "counter": 80,
+            "client_name": 120,
+            "csd_no": 110,
+            "qty_display": 160,
+            "remaining_display": 160,
+            "limit_price": 70,
+            "order_date": 80,
+            "entered_by": 90,
+            "dealer_col": 110,
+            "actions": 220,
+        }
+        for k, v in MINS.items():
+            widths[k] = max(widths.get(k, 0), v)
+
+        for o in orders:
+            status = o.get("status", "")
+            filled = o.get("shares_executed", 0)
+            ordered = o.get("num_shares", 0)
+            mode = o.get("amount_mode", "SHARES")
+            exch = o.get("exchange", "ZSE")
+            currency = "USD" if exch == "VFEX" else "ZiG"
+            total_amount = o.get("total_amount", "")
+
+            is_over = "OVER-EXECUTION" in (o.get("notes", "") or "")
+            is_overdue = (status in ("PENDING", "TAKEN") and
+                          days_since_str(o.get("entered_datetime", "")) >= OVERDUE_DAYS)
+
+            def wmax(col, text, font=f_normal):
+                widths[col] = max(widths.get(col, 0), font.measure(str(text)) + PAD * 2)
+
+            st_txt = "🚨 OVER-EXEC" if is_over else ("OVERDUE" if is_overdue else status)
+            wmax("status", st_txt, f_bold)
+            wmax("order_type", o.get("order_type", ""), f_bold)
+            wmax("counter", o.get("counter", ""), f_bold)
+            wmax("client_name", o.get("client_name", ""))
+            wmax("csd_no", o.get("csd_no", ""))
+
+            # qty_display
+            if mode == "AMOUNT":
+                try:
+                    amt_f = float(str(total_amount).replace(",", ""))
+                    if filled:
+                        ep = float(str(o.get("execution_price", "0")).replace(",", ""))
+                        amt_filled = filled * ep
+                        pct = int((amt_filled / amt_f) * 100) if amt_f else 0
+                        qty_txt = f"{currency} {amt_filled:,.2f} / {amt_f:,.2f} ({pct}%)"
+                    else:
+                        qty_txt = f"{currency} {amt_f:,.2f}"
+                except:
+                    qty_txt = str(total_amount)
+            elif filled and ordered:
+                pct = int((filled / ordered) * 100) if ordered else 0
+                qty_txt = f"{filled:,} / {ordered:,} ({pct}%)"
+            else:
+                qty_txt = f"{ordered:,}" if ordered else "-"
+            wmax("qty_display", qty_txt, f_bold)
+
+            # remaining_display
+            if mode == "AMOUNT":
+                try:
+                    amt_f = float(str(total_amount).replace(",", ""))
+                    ep = float(str(o.get("execution_price", "0")).replace(",", ""))
+                    filled_amt = filled * ep if filled else 0
+                    rem = max(0.0, amt_f - filled_amt)
+                    rem_txt = f"{currency} {rem:,.2f}" if rem > 0.01 else "✓ FULL"
+                except:
+                    rem_txt = "—"
+            elif filled and ordered:
+                remaining = ordered - filled
+                rem_txt = f"{remaining:,} sh" if remaining > 0 else "✓ FULL"
+            else:
+                rem_txt = "—"
+            wmax("remaining_display", rem_txt)
+
+            wmax("limit_price", o.get("limit_price", ""))
+            wmax("order_date", fmt_date_short(o.get("order_date", "")))
+            wmax("entered_by", o.get("entered_by", ""))
+
+            taken = o.get("taken_by", "")
+            exec_by = o.get("executed_by", "")
+            if taken:
+                d_txt = taken
+            elif exec_by:
+                d_txt = exec_by.replace("AUTO - ", "").replace(" (matched trades)", "")[:16]
+            else:
+                d_txt = "-"
+            wmax("dealer_col", d_txt, f_bold)
+
+            # Actions column: measure the worst-case button strip
+            wmax("actions", "Detail PDF Hist Edit Take Execute Release X", f_normal)
+
+        return widths
     # ── REFRESH ──────────────────────────────────────────────────────────
     def _refresh(self):
         orders = list(self.orders)
@@ -2923,12 +3151,20 @@ class App(tk.Tk):
 
         STATUS_ORDER = {"PENDING":0,"TAKEN":1,"PARTIAL":2,"EXECUTED":3,"CANCELLED":4}
         col = self._sort_col
+
         def sort_key(o):
-            if col=="status": return (STATUS_ORDER.get(o["status"],5), o.get("entered_datetime",""))
-            elif col in ("num_shares","shares_executed"): return o.get(col,0)
-            elif col=="qty_display": return o.get("num_shares",0)
-            elif col=="dealer_col": return (o.get("taken_by","") or "").lower()
-            else: return str(o.get(col,"")).lower()
+            if col == "status":
+                return (STATUS_ORDER.get(o["status"], 5), o.get("entered_datetime", ""))
+            elif col in ("num_shares", "shares_executed"):
+                return o.get(col, 0)
+            elif col == "qty_display":
+                return o.get("num_shares", 0)
+            elif col == "dealer_col":
+                return (o.get("taken_by", "") or "").lower()
+            elif col == "entered_datetime":
+                return o.get("entered_datetime", "")
+            else:
+                return str(o.get(col, "")).lower()
         orders = sorted(orders, key=sort_key, reverse=not self._sort_asc)
 
         for w in self._tbl_inner.winfo_children(): w.destroy()
@@ -2941,6 +3177,8 @@ class App(tk.Tk):
             self._visible_orders = []; return
 
         self._visible_orders = orders
+        self._col_widths = self._calc_col_widths(orders)
+        self._refresh_headers()  # ← ADD THIS LINE HERE
         self._last_render_range = None
         total_h = len(orders) * self._row_height
         self._tbl_canvas.configure(scrollregion=(0,0,0,total_h+40))
@@ -2986,10 +3224,17 @@ class App(tk.Tk):
         row = tk.Frame(parent, bg=row_bg); row.pack(fill="x")
         tk.Frame(row, bg=accent, width=4).pack(side="left", fill="y")
 
-        def lbl(text, w, anchor="w", fg="#1A2B3C", bold=False, bg=row_bg):
-            tk.Label(row, text=text, bg=bg, fg=fg,
-                     font=(FONT,9,"bold" if bold else "normal"),
-                     width=w, anchor=anchor, padx=2, pady=6).pack(side="left")
+        def lbl(text, col_id_or_w, anchor="w", fg="#1A2B3C", bold=False, bg=row_bg):
+            if isinstance(col_id_or_w, str):
+                px = self._col_widths.get(col_id_or_w, 80)
+            else:
+                px = col_id_or_w * 7
+            cell = tk.Frame(row, bg=bg, width=px, height=28)
+            cell.pack(side="left", padx=1)
+            cell.pack_propagate(False)
+            tk.Label(cell, text=text, bg=bg, fg=fg,
+                     font=(FONT, 9, "bold" if bold else "normal"),
+                     anchor=anchor, padx=4).pack(fill="both", expand=True)
 
         status_cfg = {
             "PENDING":   ("PENDING",     "#B45309","#FEF3C7"),
@@ -3006,19 +3251,27 @@ class App(tk.Tk):
             st_txt, st_fg, st_bg = "OVERDUE", "#B71C1C", "#FEE2E2"
         else:
             st_txt, st_fg, st_bg = status_cfg.get(status, (status, "#607080", BG))
-        tk.Label(row, text=st_txt, bg=st_bg, fg=st_fg,
-                 font=(FONT,8,"bold"), width=14, anchor="w",
-                 padx=4, pady=6).pack(side="left", padx=(0,2))
+        st_px = self._col_widths.get("status", 80)
+        st_cell = tk.Frame(row, bg=st_bg, width=st_px, height=28)
+        st_cell.pack(side="left", padx=1)
+        st_cell.pack_propagate(False)
+        tk.Label(st_cell, text=st_txt, bg=st_bg, fg=st_fg,
+                 font=(FONT, 8, "bold"), anchor="w", padx=4).pack(fill="both", expand=True)
 
-        ot = o["order_type"]; ot_bg = "#1A6B3A" if ot=="BUY" else "#B71C1C"
-        tk.Label(row, text=ot, bg=ot_bg, fg=WHITE,
-                 font=(FONT,8,"bold"), width=5, anchor="center", pady=6).pack(side="left", padx=(0,2))
+        ot = o["order_type"];
+        ot_bg = "#1A6B3A" if ot == "BUY" else "#B71C1C"
+        ot_px = self._col_widths.get("order_type", 50)
+        ot_cell = tk.Frame(row, bg=ot_bg, width=ot_px, height=28)
+        ot_cell.pack(side="left", padx=1)
+        ot_cell.pack_propagate(False)
+        tk.Label(ot_cell, text=ot, bg=ot_bg, fg=WHITE,
+                 font=(FONT, 8, "bold"), anchor="center", padx=4).pack(fill="both", expand=True)
 
-        lbl(o.get("counter",""), 10, bold=True, fg=FBC_DARK)
+        lbl(o.get("counter", ""), "counter", bold=True, fg=FBC_DARK)
         client = o.get("client_name", "")
         if len(client) > 14: client = client[:13] + "..."
-        lbl(client, 14)
-        lbl(o.get("csd_no", ""), 12, fg="#607080")
+        lbl(client, "client_name")
+        lbl(o.get("csd_no", ""), "csd_no", fg="#607080")
         filled = o.get("shares_executed", 0);
         ordered = o.get("num_shares", 0)
         mode = o.get("amount_mode", "SHARES")
@@ -3026,31 +3279,35 @@ class App(tk.Tk):
         currency_col = "USD" if exch_col == "VFEX" else "ZiG"
         total_amount_col = o.get("total_amount", "")
         is_over_exec = "OVER-EXECUTION" in (o.get("notes", "") or "")
-        rem_txt = "—"
-        rem_fg = "#C0C8D8"
         if mode == "AMOUNT":
             try:
                 amt_f = float(str(total_amount_col).replace(",", ""))
+                amt_display = f"{currency_col} {amt_f:,.2f}"
             except:
                 amt_f = 0.0
-            if filled and amt_f > 0:
+                amt_display = str(total_amount_col)
+            if filled:
+                exec_price = o.get("execution_price", "")
                 try:
-                    ep = float(str(o.get("execution_price", "")).replace(",", ""))
+                    ep = float(str(exec_price).replace(",", ""))
                     amt_filled = filled * ep
-                    pct = int((amt_filled / amt_f) * 100)
-                    qty_txt = f"{amt_filled:,.2f} / {amt_f:,.2f} ({pct}%)"
+                    pct = int((amt_filled / amt_f) * 100) if amt_f else 0
+                    qty_txt = f"{currency_col} {amt_filled:,.2f} / {amt_f:,.2f} ({pct}%)"
                     amt_remaining = max(0.0, amt_f - amt_filled)
                     if amt_remaining > 0.01:
-                        rem_txt = f"{amt_remaining:,.2f}"
+                        rem_txt = f"{currency_col} {amt_remaining:,.2f}"
                         rem_fg = "#B45309"
                     else:
                         rem_txt = "✓ FULL"
                         rem_fg = "#1A6B3A"
                 except:
-                    qty_txt = f"{amt_f:,.2f}"
+                    qty_txt = f"{filled:,} sh / {amt_display}"
+                    rem_txt = "—";
+                    rem_fg = "#C0C8D8"
             else:
-                qty_txt = f"{amt_f:,.2f}" if amt_f else str(total_amount_col)
-
+                qty_txt = amt_display
+                rem_txt = amt_display;
+                rem_fg = "#0066B3"
         elif filled and ordered:
             remaining = ordered - filled
             pct = int((filled / ordered) * 100) if ordered else 0
@@ -3069,11 +3326,13 @@ class App(tk.Tk):
         qty_fg = "#B71C1C" if is_over_exec else (
             "#0066B3" if mode == "AMOUNT" else
             "#6B21A8" if (status == "PARTIAL" and filled) else "#1A2B3C")
-        lbl(qty_txt, 28, anchor="e", fg=qty_fg, bold=(mode == "AMOUNT" or status == "PARTIAL" or is_over_exec))
-        lbl(rem_txt, 20, anchor="e", fg=rem_fg, bold=(rem_txt not in ("—", "✓ FULL") or rem_txt == "✓ FULL"))
-        lbl(o.get("limit_price","-"), 9, anchor="e", fg="#607080")
-        lbl(fmt_date_short(o.get("order_date","")), 10, anchor="center", fg="#607080")
-        lbl(o.get("entered_by", ""), 10, anchor="center", fg="#607080")
+        lbl(qty_txt, "qty_display", anchor="e", fg=qty_fg,
+            bold=(mode == "AMOUNT" or status == "PARTIAL" or is_over_exec))
+        lbl(rem_txt, "remaining_display", anchor="e", fg=rem_fg,
+            bold=(rem_txt not in ("—", "✓ FULL") or rem_txt == "✓ FULL"))
+        lbl(o.get("limit_price", "-"), "limit_price", anchor="e", fg="#607080")
+        lbl(fmt_date_short(o.get("order_date", "")), "order_date", anchor="center", fg="#607080")
+        lbl(o.get("entered_by", ""), "entered_by", anchor="center", fg="#607080")
         # Dealer column - RED for TAKEN/PARTIAL
         taken   = o.get("taken_by","")
         exec_by = o.get("executed_by","")
@@ -3087,10 +3346,13 @@ class App(tk.Tk):
             dealer_txt = short_exec; dealer_fg = "#607080"; dealer_bg = row_bg
         else:
             dealer_txt = "-"; dealer_fg = "#C0C8D8"; dealer_bg = row_bg
-        tk.Label(row, text=dealer_txt, bg=dealer_bg, fg=dealer_fg,
+        dl_px = self._col_widths.get("dealer_col", 80)
+        dl_cell = tk.Frame(row, bg=dealer_bg, width=dl_px, height=28)
+        dl_cell.pack(side="left", padx=1)
+        dl_cell.pack_propagate(False)
+        tk.Label(dl_cell, text=dealer_txt, bg=dealer_bg, fg=dealer_fg,
                  font=(FONT, 8, "bold" if (taken and status in ("TAKEN", "PARTIAL")) else "normal"),
-                 width=13, anchor="w", padx=4, pady=6).pack(side="left", padx=(0, 2))
-
+                 anchor="w", padx=4).pack(fill="both", expand=True)
         act_frame = tk.Frame(row, bg=row_bg); act_frame.pack(side="left", padx=4)
         def mini_btn(text, bg, fg, cmd, width=5):
             return tk.Button(act_frame, text=text, font=(FONT,8), bg=bg, fg=fg,
