@@ -587,23 +587,67 @@ def build_execution_from_rows(order, csv_rows):
     total_value = 0.0
 
     for r in csv_rows:
-        qty       = _clean_qty(r.get("Quantity", 0))
+        qty = _clean_qty(r.get("Quantity", 0))
         yield_raw = _clean_price(r.get("Yield") or 0)
-        price     = round(yield_raw / 100, 4)   # cents → ZiG
+        market = (r.get("Market") or "").strip().upper()
+        if market == "VFX" or market == "VFEX":
+            price = round(yield_raw, 4)  # already USD
+        else:
+            price = round(yield_raw / 100, 4)  # ZSE cents → ZiG
         total_qty   += qty
         total_value += qty * price
 
     avg_price = round(total_value / total_qty, 4) if total_qty else 0.0
 
-    ordered_qty    = order.get("num_shares", 0)
+    # ── Calculate deal total including charges ───────────────────────────
+    is_vfex = any((r.get("Market") or "").strip().upper() in ("VFX", "VFEX") for r in csv_rows)
+    consideration = total_qty * avg_price
+    order_type = order.get("order_type", "BUY").upper()
+    if is_vfex:
+        commission = consideration * 0.0060
+        vat_comm = commission * 0.155
+        vfex_levy = consideration * 0.0016
+        csd_levy = consideration * 0.0005
+        stamp = consideration * 0.0025
+        sec_levy = consideration * 0.0016
+        total_charges = commission + vat_comm + vfex_levy + csd_levy + stamp + sec_levy
+    else:
+        commission = consideration * 0.0092
+        vat_comm = commission * 0.155
+        zse_levy = consideration * 0.0010
+        csd_levy = consideration * 0.0010
+        stamp = consideration * 0.0025
+        sec_levy = consideration * 0.0016
+        inv_prot = consideration * 0.00025
+        cap_gains = consideration * 0.010
+        total_charges = commission + vat_comm + zse_levy + csd_levy + stamp + sec_levy + inv_prot + cap_gains
+    if order_type == "BUY":
+        deal_total = consideration + total_charges
+    else:
+        deal_total = consideration - total_charges
+
+    ordered_qty = order.get("num_shares", 0)
     already_filled = order.get("shares_executed", 0)
     new_cumulative = already_filled + total_qty  # raw, uncapped
 
+    # ── Check against total_amount if order was entered by amount ────────
+    amount_mode = order.get("amount_mode", "SHARES")
+    total_amount = order.get("total_amount", "")
+    amount_filled = False
+    amount_remaining = None
+    if amount_mode == "AMOUNT" and total_amount:
+        try:
+            ordered_amount = float(str(total_amount).replace(",", ""))
+            amount_filled = (deal_total >= ordered_amount * 0.995)  # 0.5% tolerance
+            amount_remaining = max(0.0, ordered_amount - deal_total)
+        except:
+            pass
+
     if ordered_qty > 0 and new_cumulative > ordered_qty:
         excess = new_cumulative - ordered_qty
-        return total_qty, avg_price, "OVER_EXECUTED", excess
+        return total_qty, avg_price, "OVER_EXECUTED", excess, deal_total, total_charges, amount_remaining
 
-    return total_qty, avg_price, "OK", 0
+    return total_qty, avg_price, "OK", 0, deal_total, total_charges, amount_remaining
 class SheetsSetupDialog(tk.Toplevel):
     def __init__(self, parent, settings, on_save):
         super().__init__(parent)
@@ -965,35 +1009,89 @@ class NewOrderDialog(tk.Toplevel):
         shares = 0; total_amount = ""
         if mode == "SHARES":
             raw = self._num_shares.get().strip()
-            if not raw: messagebox.showwarning("Missing","Please enter number of shares.",parent=self); return
-            try: shares = int(raw.replace(",",""))
-            except: messagebox.showwarning("Invalid","Number of shares must be a whole number.",parent=self); return
-            if shares <= 0: messagebox.showwarning("Invalid","Shares must be greater than zero.",parent=self); return
+            if not raw: messagebox.showwarning("Missing", "Please enter number of shares.", parent=self); return
+            try:
+                shares = int(raw.replace(",", ""))
+            except:
+                messagebox.showwarning("Invalid", "Number of shares must be a whole number.", parent=self); return
+            if shares <= 0: messagebox.showwarning("Invalid", "Shares must be greater than zero.", parent=self); return
         else:
             raw = self._total_amount.get().strip()
-            if not raw: messagebox.showwarning("Missing","Please enter the total amount.",parent=self); return
-            try: float(raw.replace(",",""))
-            except: messagebox.showwarning("Invalid","Total amount must be a number.",parent=self); return
+            if not raw: messagebox.showwarning("Missing", "Please enter the total amount.", parent=self); return
+            try:
+                amt = float(raw.replace(",", ""))
+            except:
+                messagebox.showwarning("Invalid", "Total amount must be a number.", parent=self);
+                return
             total_amount = raw
+            # ── Estimate shares from amount ──────────────────────────────
+            try:
+                price = float(limit.strip().replace(",", ""))
+                if price > 0:
+                    exch = self._exchange.get()
+                    order_type = self._order_type.get()
+                    if exch == "VFEX":
+                        charge_rate = 0.0060 + 0.0016 + 0.0005 + 0.0025 + (0.0060 * 0.155) + 0.0016
+                    else:
+                        charge_rate = 0.0092 + 0.0010 + 0.0010 + 0.0025 + (0.0092 * 0.155) + 0.0016 + 0.00025 + 0.010
+                    if order_type == "BUY":
+                        est_shares = int(amt / (price * (1 + charge_rate)))
+                    else:
+                        est_shares = int(amt / (price * (1 - charge_rate)))
+                    if est_shares > 0:
+                        consideration = est_shares * price
+                        if exch == "VFEX":
+                            commission = consideration * 0.0060
+                            vat_comm = commission * 0.155
+                            vfex_levy = consideration * 0.0016
+                            csd_levy = consideration * 0.0005
+                            stamp = consideration * 0.0025
+                            sec_levy = consideration * 0.0016
+                            total_charges = commission + vat_comm + vfex_levy + csd_levy + stamp + sec_levy
+                        else:
+                            commission = consideration * 0.0092
+                            vat_comm = commission * 0.155
+                            zse_levy = consideration * 0.0010
+                            csd_levy = consideration * 0.0010
+                            stamp = consideration * 0.0025
+                            sec_levy = consideration * 0.0016
+                            inv_prot = consideration * 0.00025
+                            cap_gains = consideration * 0.010
+                            total_charges = commission + vat_comm + zse_levy + csd_levy + stamp + sec_levy + inv_prot + cap_gains
+                        if order_type == "BUY":
+                            deal_total = consideration + total_charges
+                        else:
+                            deal_total = consideration - total_charges
+                        currency = "USD" if exch == "VFEX" else "ZiG"
+                        msg = (f"Estimated shares for {currency} {amt:,.2f} @ {price}:\n\n"
+                               f"  Shares:         {est_shares:,}\n"
+                               f"  Consideration:  {currency} {consideration:,.2f}\n"
+                               f"  Total charges:  {currency} {total_charges:,.2f}\n"
+                               f"  Deal total:     {currency} {deal_total:,.2f}\n\n"
+                               f"Proceed with {est_shares:,} shares?")
+                        if not messagebox.askyesno("Share Estimate", msg, parent=self):
+                            return
+                        shares = est_shares
+            except:
+                pass
             # ── Duplicate detection ──────────────────────────────────────
-            dupes = [o for o in self._orders_ref
-                     if o.get("csd_no", "").strip().upper() == csd.strip().upper()
-                     and o.get("counter", "").strip().upper() == counter.strip().upper()
-                     and o.get("order_type", "") == self._order_type.get()
-                     and o.get("status", "") in ("PENDING", "TAKEN", "PARTIAL")]
-            if dupes:
-                d = dupes[0]
-                msg = (f"⚠  Possible Duplicate Order Detected\n\n"
-                       f"Client {d.get('client_name', '')} already has an open "
-                       f"{d.get('order_type', '')} order for {d.get('counter', '')}:\n\n"
-                       f"  Order ID:  {d.get('id', '')}\n"
-                       f"  Status:    {d.get('status', '')}\n"
-                       f"  Shares:    {d.get('num_shares', 0):,}\n"
-                       f"  Entered:   {fmt_dt(d.get('entered_datetime', ''))}\n\n"
-                       f"Are you sure you want to post another order?")
-                if not messagebox.askyesno("Duplicate Warning", msg,
-                                           icon="warning", parent=self):
-                    return
+        dupes = [o for o in self._orders_ref
+                 if o.get("csd_no", "").strip().upper() == csd.strip().upper()
+                 and o.get("counter", "").strip().upper() == counter.strip().upper()
+                 and o.get("order_type", "") == self._order_type.get()
+                 and o.get("status", "") in ("PENDING", "TAKEN", "PARTIAL")]
+        if dupes:
+            d = dupes[0]
+            msg = (f"⚠  Possible Duplicate Order Detected\n\n"
+                   f"Client {d.get('client_name', '')} already has an open "
+                   f"{d.get('order_type', '')} order for {d.get('counter', '')}:\n\n"
+                   f"  Order ID:  {d.get('id', '')}\n"
+                   f"  Status:    {d.get('status', '')}\n"
+                   f"  Shares:    {d.get('num_shares', 0):,}\n"
+                   f"  Entered:   {fmt_dt(d.get('entered_datetime', ''))}\n\n"
+                   f"Are you sure you want to post another order?")
+            if not messagebox.askyesno("Duplicate Warning", msg, icon="warning", parent=self):
+                return
         now = datetime.now()
         order = {
             "id": new_id(), "order_type": self._order_type.get(), "client_name": client,
@@ -1308,7 +1406,7 @@ class MatchedTradesDialog(tk.Toplevel):
                      bg=BG, fg=FBC_MID, font=(FONT,9,"bold")).pack(anchor="w", pady=(4,3))
         for order, csv_rows, conf, how in self._matched:
             # REPLACE WITH:
-            qty, avg_price, exec_flag, excess_qty = build_execution_from_rows(order, csv_rows)
+            qty, avg_price, exec_flag, excess_qty, deal_total, total_charges, amount_remaining = build_execution_from_rows(order, csv_rows)
             oid = order["id"];
             ordered_qty = order.get("num_shares", 0)
             already_filled = order.get("shares_executed", 0)
@@ -1344,7 +1442,13 @@ class MatchedTradesDialog(tk.Toplevel):
                      bg=conf_bg, fg="#607080", font=(FONT,8)).pack(anchor="w", pady=(1,0))
             fill_label = "PARTIAL FILL" if is_partial else "FULL FILL"
             fill_col   = "#6B21A8" if is_partial else "#1A6B3A"
-            tk.Label(info, text=f"-> [{fill_label}]  +{qty:,} shares @ {avg_price}  =  {new_total_fill:,} total filled",
+            currency = "USD" if any((r.get("Market", "") or "").upper() in ("VFX", "VFEX") for r in csv_rows) else "ZiG"
+            charges_line = f"  |  charges: {currency} {total_charges:,.2f}  |  deal total: {currency} {deal_total:,.2f}"
+            amount_line = ""
+            if amount_remaining is not None:
+                amount_line = f"  →  {currency} {amount_remaining:,.2f} remaining" if amount_remaining > 0.5 else "  →  AMOUNT FULLY FILLED"
+            tk.Label(info,
+                     text=f"-> [{fill_label}]  +{qty:,} shares @ {avg_price}  =  {new_total_fill:,} total filled{charges_line}{amount_line}",
                      bg=conf_bg, fg=fill_col, font=(FONT,10,"bold")).pack(anchor="w", pady=(4,0))
             # REPLACE WITH:
             if is_over:
@@ -1396,7 +1500,8 @@ class MatchedTradesDialog(tk.Toplevel):
         for order, csv_rows, conf, how in self._matched:
             if order["id"] not in selected_ids: continue
             # REPLACE WITH:
-            qty, avg_price, exec_flag, excess_qty = build_execution_from_rows(order, csv_rows)
+            qty, avg_price, exec_flag, excess_qty, deal_total, total_charges, amount_remaining = build_execution_from_rows(
+                order, csv_rows)
             ordered_qty = order.get("num_shares", 0)
             already_filled = order.get("shares_executed", 0)
             is_over = (exec_flag == "OVER_EXECUTED")
@@ -1412,8 +1517,10 @@ class MatchedTradesDialog(tk.Toplevel):
             # REPLACE WITH:
             over_note = (f"  ⚠ OVER-EXECUTION: CSV showed {already_filled + qty:,}, "
                          f"capped at {ordered_qty:,} (excess {excess_qty:,} sh)" if is_over else "")
+            currency = "USD" if any((r.get("Market", "") or "").upper() in ("VFX", "VFEX") for r in csv_rows) else "ZiG"
             note_line = (f"[{now[:10]}] Matched trade: +{qty:,} sh @ {avg_price}"
                          + (f"  ({new_total_fill:,}/{ordered_qty:,} filled)" if ordered_qty else "")
+                         + f"  deal total: {currency} {deal_total:,.2f}"
                          + over_note)
             existing = order.get("notes","")
             order["notes"] = (existing+"\n"+note_line).strip() if existing else note_line
