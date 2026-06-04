@@ -3318,17 +3318,20 @@ class ClientHistoryDialog(tk.Toplevel):
 
         # ── Orders table ─────────────────────────────────────────────
         tk.Frame(self, bg=SEP_CLR, height=1).pack(fill="x", padx=16)
-
+        tk.Label(self,
+                 text="💡  Right-click any order row to view details, take, execute, cancel, print PDF and more.",
+                 bg="#FFF8E7", fg="#B45309", font=(FONT, 8), pady=4).pack(fill="x", padx=16)
         tbl_outer = tk.Frame(self, bg=BG)
         tbl_outer.pack(fill="both", expand=True, padx=16, pady=(6,0))
 
-        hdr_frame = tk.Frame(tbl_outer, bg=TBL_HDR_BG); hdr_frame.pack(fill="x")
+        hdr_frame = tk.Frame(tbl_outer, bg=TBL_HDR_BG)
+        hdr_frame.pack(fill="x")
         h_cols = [("Date", 10), ("Type", 5), ("Counter", 10), ("Qty / Amount", 13),
                   ("Limit", 9), ("Status", 13), ("Filled", 12),
                   ("Exec Price", 10), ("Dealer", 13), ("Entered By", 11)]
         for label, w in h_cols:
             tk.Label(hdr_frame, text=label, bg=TBL_HDR_BG, fg=TBL_HDR_FG,
-                     font=(FONT,8,"bold"), width=w, anchor="w",
+                     font=(FONT, 8, "bold"), width=w, anchor="w",
                      padx=4, pady=5).pack(side="left")
 
         # Scrollable rows
@@ -3539,7 +3542,15 @@ class App(tk.Tk):
 
         tk.Frame(self, bg=SEP_CLR, height=1).pack(fill="x", padx=16)
 
-        tbl_outer = tk.Frame(self, bg=BG); tbl_outer.pack(fill="both", expand=True, padx=16, pady=6)
+        # ADD THIS:
+        tk.Label(self,
+                 text="💡  Right-click any order row to view details, take, execute, cancel, print PDF and more.",
+                 bg="#FFF8E7", fg="#B45309", font=(FONT, 8), pady=4).pack(fill="x", padx=16)
+
+        tbl_outer = tk.Frame(self, bg=BG)
+        tbl_outer.pack(fill="both", expand=True, padx=16, pady=6)
+        tbl_sb_x = tk.Scrollbar(tbl_outer, orient="horizontal")
+        tbl_sb_x.pack(side="bottom", fill="x")
         self._columns = [
             ("status", "Status", 13, "w"), ("order_type", "Type", 5, "center"),
             ("counter", "Counter", 10, "w"), ("client_name", "Client", 14, "w"),
@@ -3547,10 +3558,31 @@ class App(tk.Tk):
             ("remaining_display", "Remaining", 18, "e"),
             ("limit_price", "Limit", 9, "e"), ("order_date", "Date", 10, "center"),
             ("entered_by", "Entered By", 10, "center"), ("dealer_col", "Dealer", 13, "w"),
-            ("actions", "Actions", 18, "center"),
         ]
-        self._col_widths = {c[0]: 80 for c in self._columns}  # default until data loads
-        hdr_frame = tk.Frame(tbl_outer, bg=TBL_HDR_BG); hdr_frame.pack(fill="x")
+
+        row_outer = tk.Frame(tbl_outer, bg=BG);
+        row_outer.pack(fill="both", expand=True)
+        self._tbl_canvas = tk.Canvas(row_outer, bg=BG, highlightthickness=0,
+                                     xscrollcommand=tbl_sb_x.set)
+        tbl_sb = tk.Scrollbar(row_outer, orient="vertical", command=self._tbl_canvas.yview)
+        self._tbl_canvas.configure(yscrollcommand=tbl_sb.set)
+        tbl_sb_x.config(command=self._tbl_canvas.xview)
+        tbl_sb.pack(side="right", fill="y")
+        self._tbl_canvas.pack(side="left", fill="both", expand=True)
+
+        self._tbl_container = tk.Frame(self._tbl_canvas, bg=BG)
+        self._tbl_container_id = self._tbl_canvas.create_window((0, 0), window=self._tbl_container, anchor="nw")
+        self._tbl_container.bind("<Configure>",
+                                 lambda e: self._tbl_canvas.configure(scrollregion=self._tbl_canvas.bbox("all")))
+        self._tbl_canvas.bind("<Configure>", lambda e: self._on_tbl_scroll())
+        self._tbl_canvas.bind_all("<MouseWheel>",
+                                  lambda e: (self._tbl_canvas.yview_scroll(-1 * (e.delta // 120), "units"),
+                                             self._on_tbl_scroll()))
+
+        hdr_frame = tk.Frame(self._tbl_container, bg=TBL_HDR_BG)
+        hdr_frame.pack(fill="x")
+
+        self._col_widths = {c[0]: 80 for c in self._columns}
         self._hdr_btns = {}
         for col_id, label, width, anchor in self._columns:
             cell = tk.Frame(hdr_frame, bg=TBL_HDR_BG,
@@ -3565,22 +3597,9 @@ class App(tk.Tk):
             btn.pack(fill="both", expand=True)
             self._hdr_btns[col_id] = btn
 
-        row_outer = tk.Frame(tbl_outer, bg=BG); row_outer.pack(fill="both", expand=True)
-        self._tbl_canvas = tk.Canvas(row_outer, bg=BG, highlightthickness=0)
-        tbl_sb = tk.Scrollbar(row_outer, orient="vertical", command=self._tbl_canvas.yview)
-        self._tbl_canvas.configure(yscrollcommand=tbl_sb.set)
-        tbl_sb.pack(side="right", fill="y")
-        self._tbl_canvas.pack(side="left", fill="both", expand=True)
-        self._tbl_inner = tk.Frame(self._tbl_canvas, bg=BG)
-        self._tbl_inner_id = self._tbl_canvas.create_window((0,0), window=self._tbl_inner, anchor="nw")
-        self._tbl_inner.bind("<Configure>",
-                             lambda e: self._tbl_canvas.configure(scrollregion=self._tbl_canvas.bbox("all")))
-        self._tbl_canvas.bind("<Configure>",
-                              lambda e: self._tbl_canvas.itemconfig(self._tbl_inner_id, width=e.width))
-        self._tbl_canvas.bind_all("<MouseWheel>",
-                                  lambda e: (self._tbl_canvas.yview_scroll(-1*(e.delta//120),"units"),
-                                             self._on_tbl_scroll()))
-        self._tbl_canvas.bind("<Configure>", lambda e: self._on_tbl_scroll())
+        self._tbl_inner = tk.Frame(self._tbl_container, bg=BG)
+        self._tbl_inner.pack(fill="x")
+        self._tbl_inner_id = None
 
     def _sort_by(self, col_id):
         if self._sort_col == col_id: self._sort_asc = not self._sort_asc
@@ -3633,9 +3652,12 @@ class App(tk.Tk):
             btn = self._hdr_btns.get(col_id)
             if btn:
                 px = self._col_widths.get(col_id, 80)
-                btn.master.config(width=px)  # resize the cell Frame
-                btn.config(width=px)  # resize the Button inside it
-
+                btn.master.config(width=px)
+                btn.config(width=px)
+        total_w = sum(self._col_widths.values()) + 40
+        self._tbl_canvas.configure(scrollregion=(
+            0, 0, total_w,
+            len(self._visible_orders) * self._row_height + 80))
     def _schedule_auto_sync(self):
         self._full_sync(); self.after(20_000, self._schedule_auto_sync)
 
@@ -3664,7 +3686,6 @@ class App(tk.Tk):
             "order_date": 80,
             "entered_by": 90,
             "dealer_col": 110,
-            "actions": 220,
         }
         for k, v in MINS.items():
             widths[k] = max(widths.get(k, 0), v)
@@ -3742,9 +3763,6 @@ class App(tk.Tk):
             else:
                 d_txt = "-"
             wmax("dealer_col", d_txt, f_bold)
-
-            # Actions column: measure the worst-case button strip
-            wmax("actions", "Detail PDF Hist Edit Take Execute Release X", f_normal)
 
         return widths
     # ── REFRESH ──────────────────────────────────────────────────────────
@@ -3831,7 +3849,8 @@ class App(tk.Tk):
         self._refresh_headers()  # ← ADD THIS LINE HERE
         self._last_render_range = None
         total_h = len(orders) * self._row_height
-        self._tbl_canvas.configure(scrollregion=(0,0,0,total_h+40))
+        total_w = sum(self._col_widths.values()) + 40
+        self._tbl_canvas.configure(scrollregion=(0, 0, total_w, total_h + 80))
         self._tbl_canvas.yview_moveto(0)
         self._on_tbl_scroll()
 
@@ -4014,59 +4033,83 @@ class App(tk.Tk):
         tk.Label(dl_cell, text=dealer_txt, bg=dealer_bg, fg=dealer_fg,
                  font=(FONT, 8, "bold" if (taken and status in ("TAKEN", "PARTIAL")) else "normal"),
                  anchor="w", padx=4).pack(fill="both", expand=True)
-        act_frame = tk.Frame(row, bg=row_bg); act_frame.pack(side="left", padx=4)
-        def mini_btn(text, bg, fg, cmd, width=5):
-            return tk.Button(act_frame, text=text, font=(FONT,8), bg=bg, fg=fg,
-                             relief="flat", cursor="hand2", padx=3, pady=2, width=width,
-                             activebackground=fg, activeforeground=WHITE, command=cmd)
 
-        mini_btn("Detail", BG, FBC_MID,
-                 lambda ord=o: OrderDetailDialog(self, ord)).pack(side="left", padx=1)
-        mini_btn("PDF", BG, "#6B21A8",
-                 lambda ord=o: self._print_slip(ord), width=3).pack(side="left", padx=1)
-        mini_btn("Hist", BG, "#B45309",
-                 lambda ord=o: ClientHistoryDialog(
-                     self, ord.get("client_name", ""),
-                     ord.get("csd_no", ""), self.orders),
-                 width=4).pack(side="left", padx=1)
+        # Right-click context menu
+        def _show_menu(event, _o=o, _status=status):
+            menu = tk.Menu(self, tearoff=0, font=(FONT, 9),
+                           bg=CARD_BG, fg=FBC_DARK,
+                           activebackground=FBC_MID, activeforeground=WHITE,
+                           relief="flat", bd=1)
 
-        if status == "PENDING":
-            mini_btn("Edit", BG, "#607080",
-                     lambda ord=o: self._open_edit(ord), width=4).pack(side="left", padx=1)
-            mini_btn("Take", FBC_MID, WHITE,
-                     lambda ord=o: self._take_order(ord), width=4).pack(side="left", padx=1)
-            mini_btn("X", "#FEE2E2", "#B71C1C",
-                     lambda ord=o: self._open_cancel(ord), width=2).pack(side="left", padx=1)
+            menu.add_command(label="📋  View Detail",
+                             command=lambda: OrderDetailDialog(self, _o))
+            menu.add_command(label="🖨  Print PDF Slip",
+                             command=lambda: self._print_slip(_o))
+            menu.add_command(label="📜  Client History",
+                             command=lambda: ClientHistoryDialog(
+                                 self, _o.get("client_name", ""),
+                                 _o.get("csd_no", ""), self.orders))
+            menu.add_separator()
 
-        elif status == "TAKEN":
-            if o.get("taken_by") == self.dealer_name:
-                mini_btn("Execute", "#1A6B3A", WHITE,
-                         lambda ord=o: self._open_execute(ord), width=6).pack(side="left", padx=1)
-                mini_btn("Release", BG, "#607080",
-                         lambda ord=o: self._release_order(ord), width=5).pack(side="left", padx=1)
-                mini_btn("X", "#FEE2E2", "#B71C1C",
-                         lambda ord=o: self._open_cancel(ord), width=2).pack(side="left", padx=1)
-            else:
-                tk.Label(act_frame, text=f"Held: {o.get('taken_by','')}",
-                         bg=row_bg, fg="#C0392B", font=(FONT,8,"bold")).pack(side="left")
+            if _status == "PENDING":
+                menu.add_command(label="✏  Edit Order",
+                                 command=lambda: self._open_edit(_o))
+                menu.add_command(label="✋  Take Order",
+                                 command=lambda: self._take_order(_o))
+                menu.add_separator()
+                menu.add_command(label="✕  Cancel Order",
+                                 command=lambda: self._open_cancel(_o),
+                                 foreground="#B71C1C")
 
-        elif status == "PARTIAL":
-            can_act = (o.get("taken_by")==self.dealer_name or not o.get("taken_by"))
-            if can_act:
-                mini_btn("Execute", "#6B21A8", WHITE,
-                         lambda ord=o: self._open_execute(ord), width=6).pack(side="left", padx=1)
-                mini_btn("X", "#FEE2E2", "#B71C1C",
-                         lambda ord=o: self._open_cancel(ord), width=2).pack(side="left", padx=1)
-            else:
-                tk.Label(act_frame, text=f"Held: {o.get('taken_by','')}",
-                         bg=row_bg, fg="#C0392B", font=(FONT,8,"bold")).pack(side="left")
+            elif _status == "TAKEN":
+                if _o.get("taken_by") == self.dealer_name:
+                    menu.add_command(label="✔  Execute Order",
+                                     command=lambda: self._open_execute(_o),
+                                     foreground="#1A6B3A")
+                    menu.add_command(label="↩  Release Order",
+                                     command=lambda: self._release_order(_o))
+                    menu.add_separator()
+                    menu.add_command(label="✕  Cancel Order",
+                                     command=lambda: self._open_cancel(_o),
+                                     foreground="#B71C1C")
+                else:
+                    menu.add_command(
+                        label=f"🔒  Held by {_o.get('taken_by', '')}",
+                        state="disabled")
 
-        elif status in ("CANCELLED","EXECUTED"):
-            mini_btn("Del", BG, "#CBD5E1",
-                     lambda ord=o: self._delete(ord), width=3).pack(side="left", padx=1)
+            elif _status == "PARTIAL":
+                can_act = (_o.get("taken_by") == self.dealer_name or not _o.get("taken_by"))
+                if can_act:
+                    menu.add_command(label="✔  Execute (Partial Fill)",
+                                     command=lambda: self._open_execute(_o),
+                                     foreground="#6B21A8")
+                    menu.add_separator()
+                    menu.add_command(label="✕  Cancel Order",
+                                     command=lambda: self._open_cancel(_o),
+                                     foreground="#B71C1C")
+                else:
+                    menu.add_command(
+                        label=f"🔒  Held by {_o.get('taken_by', '')}",
+                        state="disabled")
+
+            elif _status in ("CANCELLED", "EXECUTED"):
+                menu.add_separator()
+                menu.add_command(label="🗑  Delete Record",
+                                 command=lambda: self._delete(_o),
+                                 foreground="#B71C1C")
+
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        def _bind_all_children(widget, func):
+            widget.bind("<Button-3>", func)
+            for child in widget.winfo_children():
+                _bind_all_children(child, func)
+        _bind_all_children(row, _show_menu)
 
         tk.Frame(parent, bg=SEP_CLR, height=1).pack(fill="x")
-
     # ── ORDER ACTIONS ─────────────────────────────────────────────────────
     def _take_order(self, order):
         if order["status"] != "PENDING":
